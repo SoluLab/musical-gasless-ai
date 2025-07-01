@@ -1,0 +1,67 @@
+name: Build and push the Docker image to Google Artifact Registry, Deploy it to the GCP-VMs
+
+on:
+  push:
+    branches:
+      - api-gateway
+
+env:
+  GCP_PROJECT_ID: gold-episode-346919
+  GCP_ARTIFACT_REGION: us-east4
+  ARTIFACT_REPOSITORY: new-musical-app
+
+jobs:
+  build-and-deploy:
+    name: Build and Push Docker Image to Artifact Registry
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Configure Docker to Authenticate with Artifact Registry
+        run: |
+          gcloud auth configure-docker $GCP_ARTIFACT_REGION-docker.pkg.dev
+
+      - name: Create .env.development File
+        run: |
+          echo "${{ secrets.ENV_DEVELOPMENT_FILE }}" > .env.development
+
+      - name: Build, Tag, and Push Image to Artifact Registry
+        run: |
+          SERVICE_NAME=$(echo $(basename $GITHUB_REPOSITORY) | tr -cd '[:alnum:]_.-' | awk '{print tolower($0)}')
+          BRANCH_NAME=$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-' | awk '{print tolower($0)}')
+          SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7 | awk '{print tolower($0)}')
+          IMAGE_TAG=${BRANCH_NAME}-${SHORT_SHA}
+          DEPLOYMENT_IMAGE=${GCP_ARTIFACT_REGION}-docker.pkg.dev/$GCP_PROJECT_ID/$ARTIFACT_REPOSITORY/${SERVICE_NAME}:${IMAGE_TAG}
+
+          echo "Building and pushing $DEPLOYMENT_IMAGE"
+          docker build --build-arg ENV_FILE=.env.development -t $DEPLOYMENT_IMAGE .
+          docker push $DEPLOYMENT_IMAGE
+
+          echo "DEPLOYMENT_IMAGE=$DEPLOYMENT_IMAGE" >> $GITHUB_ENV
+
+      - name: Update Docker Compose on GCP VM
+        run: |
+          sudo apt-get update && sudo apt-get install -y openssh-client
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GCP_VM_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ secrets.GCP_VM_IP }} >> ~/.ssh/known_hosts
+
+          # SSH into the GCP instance and update Docker Compose for the service
+          ssh -i ~/.ssh/id_rsa ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_IP }} <<EOF
+          cd /home/musical/docker
+          # Authenticate with Google Artifact Registry
+          gcloud auth configure-docker $GCP_ARTIFACT_REGION-docker.pkg.dev
+          # Update the docker-compose.yml to use the new image tag
+          sudo sed -i "/Musical-be:/,/image:/ s|image: .*|image: ${DEPLOYMENT_IMAGE}|g" docker-compose.yml
+          # Pull the latest image and redeploy the service
+          docker compose pull Musical-be
+          docker compose up -d --no-deps Musical-be
+          EOF
